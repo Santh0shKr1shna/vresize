@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vresize"
+version = "0.1.0"
+description = "Shrink a video with ffmpeg: by resolution, by target file size, or to fit a platform's upload limit. Single file, zero dependencies."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Santhosh Santhoshkrishna", email = "santhoshsanthoshkrishna@gmail.com" },
+]
+keywords = ["ffmpeg", "video", "cli", "resize", "compress", "downscale"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/santhoshsanthoshkrishna/vresize"
+Issues = "https://github.com/santhoshsanthoshkrishna/vresize/issues"
+
+[project.scripts]
+vresize = "vresize:main"
+
+[tool.setuptools]
+py-modules = ["vresize"]
+package-dir = { "" = "src" }
