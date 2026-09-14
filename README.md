@@ -1,8 +1,8 @@
 # vresize
 
-A single-file, **zero-dependency** command-line tool that shrinks a video with
-ffmpeg — by resolution, by a target file size, or to fit a known platform's
-upload limit (Discord, WhatsApp, Telegram, ...).
+A single-file, **zero-dependency** command-line tool *and Python library*
+that shrinks a video with ffmpeg — by resolution, by a target file size, or
+to fit a known platform's upload limit (Discord, WhatsApp, Telegram, ...).
 
 Why another video-resizing wrapper? Most small ffmpeg wrappers on GitHub/PyPI
 add a dependency (`ffmpeg-python`, `click`, `rich`, ...) for something a
@@ -19,7 +19,7 @@ fit under 25MB"* and *"make this small enough for Discord."*
   - macOS: `brew install ffmpeg`
   - Linux: `sudo apt install ffmpeg`
 
-`vresize` prints a clear error and exits if FFmpeg is not found.
+`vresize` notifies with a clear error and exits if FFmpeg is not found.
 
 ## Install
 
@@ -31,6 +31,42 @@ This gives you a `vresize` command on any OS. Prefer not to install it? It's
 one file — `src/vresize.py` in this repo — with no third-party imports; copy
 it anywhere and run `python vresize.py ...` directly, or use the included
 Windows `vresize.bat` shim.
+
+## Use as a library
+
+The same file is a plain importable module — useful if you need to shrink a
+video from inside another Python app rather than shelling out to the CLI:
+
+```python
+from vresize import resize, resize_directory, ResizeError
+
+result = resize("clip.mp4", max_size="25MB")     # or target="720p", or for_platform="discord"
+print(result.output, result.output_size)
+
+batch = resize_directory("./raw_footage", "720p", recursive=True)
+print(f"{batch.ok} converted, {batch.skipped} skipped, {batch.failed} failed")
+```
+
+`resize()`/`resize_directory()` take the same knobs as the CLI flags
+(`codec`, `crf`, `preset`, `audio`, `fps`, `overwrite`, `dry_run`, ...) as
+keyword arguments, and accept `target`/`max_size` either as the same strings
+the CLI parses (`"720p"`, `"25MB"`) or as already-typed values (`720`,
+`26214400`). They raise `ValueError` for a bad argument (checked before
+anything touches ffmpeg or the filesystem) and `ResizeError` for a real
+failure (ffmpeg missing, ffmpeg error, output already exists, an upscale
+requested, ...) — `resize_directory()` records a single file's failure in
+the returned `BatchResult` instead of raising, so the rest of the batch
+still runs.
+
+Library calls are **silent by default** — nothing is printed unless you
+configure logging yourself:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)   # see status lines on stderr
+
+result = resize("clip.mp4", "720p", quiet=False)  # also show the live ffmpeg progress bar
+```
 
 ## Usage
 

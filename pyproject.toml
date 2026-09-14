@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
-    { name = "Santhosh Santhoshkrishna", email = "santhoshsanthoshkrishna@gmail.com" },
+    { name = "Santhosh Krishna", email = "santhoshsanthoshkrishna@gmail.com" },
 ]
 keywords = ["ffmpeg", "video", "cli", "resize", "compress", "downscale"]
 classifiers = [

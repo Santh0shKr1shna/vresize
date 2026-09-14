@@ -1,17 +1,27 @@
-"""Unit tests for vresize. No ffmpeg required - subprocess calls aren't exercised.
+"""Unit tests for vresize.
+
+Most tests need no ffmpeg - they exercise pure parsing/naming/command-building
+logic. A few integration tests under PublicApiIntegrationTests do a real
+encode and are skipped automatically when ffmpeg isn't on PATH.
 
 Run with: python -m unittest discover -s tests
 """
 from __future__ import annotations
 
 import argparse
+import io
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import vresize as vr  # noqa: E402
+
+HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
 class ParseTargetTests(unittest.TestCase):
@@ -118,12 +128,9 @@ class MakeTagTests(unittest.TestCase):
 
 class BuildCmdTests(unittest.TestCase):
     def _args(self, **overrides):
-        ns = argparse.Namespace(
-            codec="h264", crf=23, preset="medium", audio="copy", fps=None,
-        )
-        for k, v in overrides.items():
-            setattr(ns, k, v)
-        return ns
+        defaults = dict(codec="h264", crf=23, preset="medium", audio="copy", fps=None)
+        defaults.update(overrides)
+        return vr.EncodeOptions(**defaults)
 
     def test_basic_shape(self):
         cmd = vr.build_cmd(Path("in.mp4"), Path("out.mp4"), 720, self._args(), has_audio=True)
@@ -166,17 +173,16 @@ class ComputeBitrateTests(unittest.TestCase):
         self.assertLess(kbps, 3500)
 
     def test_too_small_raises(self):
-        with self.assertRaises(vr.ProcessError):
+        with self.assertRaises(vr.ResizeError):
             vr.compute_bitrate_kbps(10_000, 3600.0, audio_bps=128_000)
 
     def test_unknown_duration_raises(self):
-        with self.assertRaises(vr.ProcessError):
+        with self.assertRaises(vr.ResizeError):
             vr.compute_bitrate_kbps(25 * 1024 ** 2, None, audio_bps=0)
 
 
 class FindVideosTests(unittest.TestCase):
     def test_filters_by_extension(self, tmp_path=None):
-        import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "a.mp4").touch()
@@ -189,6 +195,161 @@ class FindVideosTests(unittest.TestCase):
 
             deep = vr.find_videos(root, recursive=True)
             self.assertEqual(sorted(p.name for p in deep), ["a.mp4", "c.mkv"])
+
+
+class EncodeOptionsTests(unittest.TestCase):
+    def test_default_crf_h264(self):
+        self.assertEqual(vr.EncodeOptions(codec="h264").crf, 23)
+
+    def test_default_crf_h265(self):
+        self.assertEqual(vr.EncodeOptions(codec="h265").crf, 28)
+
+    def test_explicit_crf_kept(self):
+        self.assertEqual(vr.EncodeOptions(crf=30).crf, 30)
+
+    def test_bad_crf_raises(self):
+        with self.assertRaises(ValueError):
+            vr.EncodeOptions(crf=100)
+
+    def test_bad_preset_raises(self):
+        with self.assertRaises(ValueError):
+            vr.EncodeOptions(preset="turbo")
+
+
+class CoerceHelpersTests(unittest.TestCase):
+    def test_coerce_target_passthrough_int(self):
+        self.assertEqual(vr._coerce_target(720), 720)
+
+    def test_coerce_target_none(self):
+        self.assertIsNone(vr._coerce_target(None))
+
+    def test_coerce_target_parses_string(self):
+        self.assertEqual(vr._coerce_target("4k"), 2160)
+
+    def test_coerce_target_bad_string_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            vr._coerce_target("banana")
+
+    def test_coerce_size_passthrough_int(self):
+        self.assertEqual(vr._coerce_size(1000), 1000)
+
+    def test_coerce_size_parses_string(self):
+        self.assertEqual(vr._coerce_size("25MB"), 25 * 1024 ** 2)
+
+    def test_coerce_size_bad_string_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            vr._coerce_size("not a size")
+
+
+class PresetLookupTests(unittest.TestCase):
+    def test_none_platform(self):
+        self.assertEqual(vr._preset_lookup(None), (None, None, None))
+
+    def test_known_platform(self):
+        size, height, note = vr._preset_lookup("discord")
+        self.assertEqual(size, 25 * 1024 ** 2)
+        self.assertIsNone(height)
+        self.assertTrue(note)
+
+    def test_unknown_platform_raises(self):
+        with self.assertRaises(ValueError):
+            vr._preset_lookup("myspace")
+
+
+class ResizeArgValidationTests(unittest.TestCase):
+    """resize()/resize_directory() validate arguments before touching ffmpeg
+    or the filesystem, so these need neither ffmpeg nor a real input."""
+
+    def test_resize_requires_a_target(self):
+        with self.assertRaises(ValueError):
+            vr.resize("nonexistent.mp4")
+
+    def test_resize_directory_requires_a_target(self):
+        with self.assertRaises(ValueError):
+            vr.resize_directory("nonexistent_dir")
+
+    def test_resize_rejects_unknown_platform(self):
+        with self.assertRaises(ValueError):
+            vr.resize("nonexistent.mp4", for_platform="myspace")
+
+    def test_resize_rejects_bad_crf(self):
+        with self.assertRaises(ValueError):
+            vr.resize("nonexistent.mp4", target="720p", crf=999)
+
+
+class LoggingDefaultsTests(unittest.TestCase):
+    def test_status_produces_no_stderr_output_by_default(self):
+        # No test in this file calls main()/_configure_cli_logging(), so the
+        # module logger should still carry only its default NullHandler.
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            vr.status("this should not appear anywhere")
+        finally:
+            sys.stderr = old_stderr
+        self.assertEqual(buf.getvalue(), "")
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe not on PATH")
+class PublicApiIntegrationTests(unittest.TestCase):
+    """Real ffmpeg encodes against a tiny synthetic clip."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="vresize-test-")
+        cls.clip = Path(cls.tmpdir) / "sample_360p.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=15",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                str(cls.clip),
+            ],
+            check=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_dry_run_returns_result_without_writing(self):
+        result = vr.resize(self.clip, "180p", dry_run=True)
+        self.assertTrue(result.dry_run)
+        self.assertIsNone(result.output_size)
+        self.assertEqual(result.output_height, 180)
+        self.assertFalse(result.output.exists())
+
+    def test_real_downscale(self):
+        out = Path(self.tmpdir) / "out_180p.mp4"
+        result = vr.resize(self.clip, "180p", output=str(out))
+        self.assertTrue(result.output.exists())
+        self.assertEqual(result.output_height, 180)
+        self.assertGreater(result.output_size, 0)
+        out.unlink()
+
+    def test_resize_directory_batch(self):
+        batch_dir = Path(self.tmpdir) / "batch"
+        batch_dir.mkdir(exist_ok=True)
+        shutil.copy(self.clip, batch_dir / "a.mp4")
+        shutil.copy(self.clip, batch_dir / "b.mp4")
+
+        result = vr.resize_directory(batch_dir, "180p")
+        self.assertEqual(result.ok, 2)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(result.skipped, 0)
+
+    def test_resize_directory_resume_skips_existing_output(self):
+        resume_dir = Path(self.tmpdir) / "resume"
+        resume_dir.mkdir(exist_ok=True)
+        shutil.copy(self.clip, resume_dir / "clip.mp4")
+
+        first = vr.resize_directory(resume_dir, "180p")
+        self.assertEqual(first.ok, 1)
+
+        second = vr.resize_directory(resume_dir, "180p")
+        outcome = next(f for f in second.files if f.input.name == "clip.mp4")
+        self.assertEqual(outcome.status, "skipped")
 
 
 if __name__ == "__main__":
