@@ -23,11 +23,10 @@ classifiers = [
 ]
 dependencies = []
 
-# TODO before publishing to PyPI: replace with the real GitHub username/org
-# once the repo is created — these are placeholders, not yet verified.
+
 [project.urls]
-Homepage = "https://github.com/santhoshsanthoshkrishna/vresize"
-Issues = "https://github.com/santhoshsanthoshkrishna/vresize/issues"
+Homepage = "https://github.com/Santh0shKr1shna/vresize"
+Issues = "https://github.com/Santh0shKr1shna/vresize/issues"
 
 [project.scripts]
 vresize = "vresize:main"
