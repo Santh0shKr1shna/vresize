@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vresize"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shrink a video with ffmpeg: by resolution, by target file size, or to fit a platform's upload limit. Single file, zero dependencies."
 readme = "README.md"
 license = "MIT"
