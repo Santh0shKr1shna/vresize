@@ -352,6 +352,7 @@ def build_cmd(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
     vcodec = "libx265" if opts.codec == "h265" else "libx264"
 
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(src)]
+    cmd += ["-map", "0:v:0"]
     if height is not None:
         cmd += ["-vf", f"scale=-2:{height}"]
     cmd += ["-c:v", vcodec, "-crf", str(opts.crf), "-preset", opts.preset]
@@ -361,10 +362,14 @@ def build_cmd(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
 
     if opts.audio == "none" or not has_audio:
         cmd += ["-an"]
-    elif opts.audio == "aac":
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    else:  # copy
-        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-map", "0:a"]  # all audio tracks, not just ffmpeg's default pick
+        if opts.audio == "aac":
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+        else:  # copy
+            cmd += ["-c:a", "copy"]
+
+    cmd += ["-map", "0:s?", "-c:s", "copy"]  # subtitles, if any; same container in/out so copy always fits
 
     if dst.suffix.lower() in FASTSTART_EXTS:
         cmd += ["-movflags", "+faststart"]
@@ -396,6 +401,7 @@ def build_pass_cmd(src: Path, dst: Path, height: int | None, vcodec: str, preset
                     kbps: float, pass_num: int, passlogfile: str, fps: float | None,
                     audio_mode: str, has_audio: bool, faststart: bool) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(src)]
+    cmd += ["-map", "0:v:0"]
     if height is not None:
         cmd += ["-vf", f"scale=-2:{height}"]
     cmd += ["-c:v", vcodec, "-b:v", f"{kbps:.0f}k", "-preset", preset]
@@ -412,7 +418,8 @@ def build_pass_cmd(src: Path, dst: Path, height: int | None, vcodec: str, preset
     if audio_mode == "none" or not has_audio:
         cmd += ["-an"]
     else:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-map", "0:a", "-c:a", "aac", "-b:a", "128k"]  # all audio tracks
+    cmd += ["-map", "0:s?", "-c:s", "copy"]  # subtitles, if any
     if faststart:
         cmd += ["-movflags", "+faststart"]
     cmd += ["-map_metadata", "0", str(dst)]

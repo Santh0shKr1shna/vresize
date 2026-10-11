@@ -328,6 +328,69 @@ class PublicApiIntegrationTests(unittest.TestCase):
         self.assertGreater(result.output_size, 0)
         out.unlink()
 
+    def test_multi_audio_tracks_preserved(self):
+        # regression: ffmpeg drops every stream but its default pick unless
+        # told otherwise - build_cmd/build_pass_cmd must -map all audio.
+        src = Path(self.tmpdir) / "multi_audio.mkv"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-f", "lavfi", "-i", "sine=frequency=880:duration=1",
+                "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-c:a", "aac",
+                str(src),
+            ],
+            check=True,
+        )
+
+        def audio_stream_count(path):
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            return len([l for l in out.splitlines() if l.strip()])
+
+        self.assertEqual(audio_stream_count(src), 2)
+
+        out = Path(self.tmpdir) / "multi_audio_180p.mkv"
+        for audio_mode in ("copy", "aac"):
+            vr.resize(src, "180p", output=str(out), audio=audio_mode, overwrite=True)
+            self.assertEqual(audio_stream_count(out), 2, f"audio={audio_mode}")
+
+        vr.resize(src, output=str(out), max_size="2MB", overwrite=True)
+        self.assertEqual(audio_stream_count(out), 2, "max_size two-pass")
+
+    def test_subtitle_track_preserved(self):
+        srt = Path(self.tmpdir) / "subs.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+        src = Path(self.tmpdir) / "with_subs.mkv"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=15",
+                "-i", str(srt),
+                "-map", "0:v", "-map", "1:s",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-c:s", "srt",
+                str(src),
+            ],
+            check=True,
+        )
+
+        def subtitle_stream_count(path):
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "s",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            return len([l for l in out.splitlines() if l.strip()])
+
+        out = Path(self.tmpdir) / "with_subs_180p.mkv"
+        vr.resize(src, "180p", output=str(out))
+        self.assertEqual(subtitle_stream_count(out), 1)
+
     def test_resize_directory_batch(self):
         batch_dir = Path(self.tmpdir) / "batch"
         batch_dir.mkdir(exist_ok=True)
