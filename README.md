@@ -48,7 +48,7 @@ print(f"{batch.ok} converted, {batch.skipped} skipped, {batch.failed} failed")
 ```
 
 `resize()`/`resize_directory()` take the same knobs as the CLI flags
-(`codec`, `crf`, `preset`, `audio`, `fps`, `overwrite`, `dry_run`, ...) as
+(`codec`, `crf`, `preset`, `audio`, `fps`, `gpu`, `overwrite`, `dry_run`, ...) as
 keyword arguments, and accept `target`/`max_size` either as the same strings
 the CLI parses (`"720p"`, `"25MB"`) or as already-typed values (`720`,
 `26214400`). They raise `ValueError` for a bad argument (checked before
@@ -94,6 +94,7 @@ size and resolution at once).
 | `--overwrite`            | replace an existing output file (in batch mode, an existing output is *skipped* instead, unless this is set) |
 | `--dry-run`              | print the ffmpeg command(s) and planned output, run nothing      |
 | `--quiet`                | suppress the progress bar                                        |
+| `--gpu {off,auto,nvidia,intel,amd,apple}` | encode on the GPU (default `off`), see [GPU encoding](#gpu-encoding) |
 
 `vresize` only downscales, it refuses a resolution target that isn't smaller
 than the source. A file-size or platform target with no explicit resolution
@@ -160,6 +161,79 @@ the same options; an output that already exists is **skipped** rather than
 treated as an error, so a batch run is safe to re-run/resume. The command
 exits non-zero if any file failed or ffmpeg errored on it, after finishing
 the rest of the batch.
+
+### GPU encoding
+
+`--gpu` hands the video encode to your graphics hardware through ffmpeg's
+built-in hardware encoders. It is **off by default**, you opt in per run:
+
+```
+vresize clip.mp4 720p --gpu auto       # first GPU that actually works
+vresize clip.mp4 720p --gpu nvidia     # this one or nothing
+```
+
+| `--gpu`  | Hardware                         | ffmpeg encoders                         |
+|----------|----------------------------------|-----------------------------------------|
+| `nvidia` | NVIDIA GeForce/Quadro (NVENC)    | `h264_nvenc`, `hevc_nvenc`              |
+| `intel`  | Intel iGPU / Arc (Quick Sync)    | `h264_qsv`, `hevc_qsv`                  |
+| `amd`    | AMD Radeon (AMF, Windows)        | `h264_amf`, `hevc_amf`                  |
+| `apple`  | Mac (VideoToolbox)               | `h264_videotoolbox`, `hevc_videotoolbox`|
+| `auto`   | tries `nvidia` → `intel` → `amd` (`apple` on macOS) | |
+
+**Before using it, know this:**
+
+- **Having a GPU doesn't mean GPU encoding will work.** Your ffmpeg build
+  needs that encoder compiled in, your GPU generation needs to support the
+  codec (older Intel iGPUs can't do HEVC, for example), and your driver has
+  to be new enough for your ffmpeg (a recent ffmpeg can need a recent
+  NVIDIA driver). So `vresize` doesn't guess: it runs a split-second trial
+  encode first, and if that fails it shows you ffmpeg's actual reason, e.g.
+  `Driver does not support the required nvenc API version`.
+- **Faster, not smaller.** GPU encoders trade compression efficiency for
+  speed: at the same quality setting the file usually comes out **bigger**
+  than with the CPU (x264/x265). The gain is biggest with NVIDIA on long,
+  high-resolution videos. On integrated graphics it can be no faster at
+  all. If file size is what you care about, leave `--gpu` off.
+- **Only the encode moves to the GPU.** Decoding and scaling still run on
+  the CPU.
+- **`--max-size` / `--for` always use the CPU**, even with `--gpu`. Hitting a
+  byte budget needs a true two-pass encode, which hardware encoders don't
+  do. `vresize` prints a note and continues on the CPU.
+- Linux VAAPI isn't supported. On Linux, use `nvidia` or `intel`.
+
+**Quality (`--crf`) and speed (`--preset`) with a GPU.** Hardware encoders
+have no CRF, so `--crf` goes to each one's closest constant-quality setting.
+Lower still means better, but **the same number produces a different file
+size on each encoder**, so expect to tune it once for your hardware:
+
+| `--gpu`  | `--crf N` becomes                  | `--preset` becomes                                   |
+|----------|------------------------------------|------------------------------------------------------|
+| `nvidia` | `-rc vbr -cq N`                    | `p1` (ultrafast) … `p4` (medium) … `p7` (veryslow)   |
+| `intel`  | `-global_quality N`                | the same name (`ultrafast`/`superfast` → `veryfast`) |
+| `amd`    | `-rc cqp -qp_i N -qp_p N`          | `speed` (≤ fast), `balanced` (medium), `quality` (≥ slow) |
+| `apple`  | `-q:v (100 − 1.5·N)` (higher = better), e.g. 23 → 66 | ignored                       |
+
+`--crf 0` (lossless on x264) becomes `1` on a GPU, since `0` means something
+else to these encoders. Constant quality on Apple needs Apple Silicon; on an
+Intel Mac the trial encode fails and tells you so.
+
+**When the GPU can't be used.** If the trial encode fails, or a GPU encode
+fails partway through a file (out of memory, GPU busy, resolution not
+supported), `vresize` shows the reason and asks:
+
+```
+Encode on the CPU instead? (applies to the rest of this run) [y/N]
+```
+
+The answer is remembered for the rest of the run, so a batch only asks once.
+When input isn't a terminal (scripts, CI, piped stdin) it never asks: it
+fails with a non-zero exit code. Re-run with `--gpu off` to use the CPU.
+
+From Python, pass `gpu="auto"` (or a vendor) to `resize()`/`resize_directory()`.
+The library never prompts: a GPU problem raises `ResizeError`, or in
+`resize_directory()` marks that file as failed. Calling `resize_directory()`
+again with `gpu="off"` redoes only the failed files, since finished outputs
+are skipped.
 
 ## Design principles
 

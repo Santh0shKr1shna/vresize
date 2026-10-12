@@ -25,6 +25,7 @@ quiet=False to also get the live ffmpeg progress bar on stderr.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # --- exit codes (CLI) -------------------------------------------------------
 EXIT_OK = 0
@@ -67,6 +69,24 @@ X264_PRESETS = (
     "medium", "slow", "slower", "veryslow",
 )
 
+# GPU vendor -> codec -> ffmpeg hardware encoder. Being compiled into ffmpeg
+# says nothing about whether it works on this machine (missing GPU, old
+# driver, unsupported codec on that GPU generation), so every one is
+# trial-encoded before use - see probe_gpu().
+# ponytail: Linux VAAPI left out (needs -vaapi_device + hwupload plumbing); add if asked.
+GPU_ENCODERS = {
+    "nvidia": {"h264": "h264_nvenc", "h265": "hevc_nvenc"},
+    "intel": {"h264": "h264_qsv", "h265": "hevc_qsv"},
+    "amd": {"h264": "h264_amf", "h265": "hevc_amf"},
+    "apple": {"h264": "h264_videotoolbox", "h265": "hevc_videotoolbox"},
+}
+GPU_CHOICES = ("off", "auto", *GPU_ENCODERS)
+# x264 preset name -> each vendor's nearest speed/quality setting
+NVENC_PRESETS = dict(zip(X264_PRESETS, ("p1", "p1", "p2", "p3", "p3", "p4", "p5", "p6", "p7")))
+QSV_PRESETS = dict(zip(X264_PRESETS, ("veryfast", "veryfast", "veryfast", "faster", "fast",
+                                      "medium", "slow", "slower", "veryslow")))
+AMF_PRESETS = dict(zip(X264_PRESETS, ("speed",) * 5 + ("balanced",) + ("quality",) * 3))
+
 
 @dataclass
 class EncodeOptions:
@@ -80,6 +100,10 @@ class EncodeOptions:
     overwrite: bool = False
     dry_run: bool = False
     quiet: bool = True
+    gpu: str = "off"
+    # Asked (with the reason) when the GPU can't be used or fails mid-encode;
+    # True = redo on the CPU. None = no fallback, raise ResizeError instead.
+    cpu_fallback: Callable[[str], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.crf is None:
@@ -91,6 +115,8 @@ class EncodeOptions:
                 f"preset {self.preset!r} is not a valid x264/x265 preset; "
                 f"choose one of: {', '.join(X264_PRESETS)}"
             )
+        if self.gpu not in GPU_CHOICES:
+            raise ValueError(f"gpu must be one of: {', '.join(GPU_CHOICES)} (got {self.gpu!r})")
 
 
 # --- public result types -----------------------------------------------
@@ -345,18 +371,94 @@ def derive_output_path(src: Path, tag: str, explicit: str | None, do_token_repla
     return src.with_name(new_stem + src.suffix)
 
 
-def build_cmd(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
-              has_audio: bool) -> list[str]:
-    """Single-pass, constant-quality (CRF) encode - used when no file-size
-    budget is in play."""
-    vcodec = "libx265" if opts.codec == "h265" else "libx264"
+def cpu_encoder(codec: str) -> str:
+    return "libx265" if codec == "h265" else "libx264"
 
+
+def video_encoder_args(opts: EncodeOptions, vendor: str | None) -> list[str]:
+    """-c:v + quality/speed flags for a constant-quality encode. vendor=None
+    is the CPU (x264/x265). GPU encoders have no CRF; opts.crf is passed to
+    each one's nearest equivalent, so the same number gives a different size
+    per encoder (documented in the README)."""
+    if vendor is None:
+        return ["-c:v", cpu_encoder(opts.codec), "-crf", str(opts.crf),
+                "-preset", opts.preset, "-pix_fmt", "yuv420p"]
+    q = str(max(1, opts.crf))  # 0 means "encoder decides" on NVENC, invalid on QSV
+    args = ["-c:v", GPU_ENCODERS[vendor][opts.codec]]
+    if vendor == "nvidia":
+        args += ["-preset", NVENC_PRESETS[opts.preset], "-rc", "vbr", "-cq", q, "-b:v", "0"]
+    elif vendor == "intel":
+        args += ["-preset", QSV_PRESETS[opts.preset], "-global_quality", q]
+    elif vendor == "amd":
+        args += ["-quality", AMF_PRESETS[opts.preset], "-rc", "cqp", "-qp_i", q, "-qp_p", q]
+    else:  # apple: -q:v is 1-100, higher = better; crf 23 -> 66, crf 28 -> 58
+        args += ["-q:v", str(max(1, min(100, round(100 - opts.crf * 1.5))))]
+    args += ["-pix_fmt", "nv12" if vendor == "intel" else "yuv420p"]
+    return args
+
+
+@functools.lru_cache(maxsize=None)
+def probe_gpu(encoder_args: tuple[str, ...]) -> str | None:
+    """Trial-encode a few blank frames with these exact encoder args. Returns
+    None if it works, else ffmpeg's first error line. Cached, so a batch run
+    probes once (~1-2s), not once per file."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+           "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2",
+           *encoder_args, "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "trial encode timed out"
+    if r.returncode == 0:
+        return None
+    lines = [ln.strip() for ln in r.stderr.splitlines() if ln.strip()]
+    return lines[0] if lines else f"ffmpeg exited with code {r.returncode}"
+
+
+def _fall_back_to_cpu(opts: EncodeOptions, reason: str) -> None:
+    """Ask opts.cpu_fallback whether to redo on the CPU; raise if not."""
+    if opts.cpu_fallback is not None:
+        if opts.cpu_fallback(reason):
+            status("  note   : encoding on the CPU instead")
+            return
+        raise ResizeError("GPU encode not possible and CPU fallback declined")  # reason already shown by the callback
+    raise ResizeError(f"{reason}\n  (use --gpu off / gpu='off' to encode on the CPU)")
+
+
+def resolve_gpu(opts: EncodeOptions, size_mode: bool) -> str | None:
+    """The GPU vendor to encode with, or None for the CPU."""
+    if opts.gpu == "off":
+        return None
+    if size_mode:
+        status("  note   : size budgets always encode on the CPU (GPU encoders have no true two-pass)")
+        return None
+    if opts.gpu != "auto":
+        vendors = [opts.gpu]
+    elif sys.platform == "darwin":
+        vendors = ["apple"]
+    else:
+        vendors = ["nvidia", "intel", "amd"]
+    errors = []
+    for v in vendors:
+        err = probe_gpu(tuple(video_encoder_args(opts, v)))
+        if err is None:
+            return v
+        errors.append(f"    {GPU_ENCODERS[v][opts.codec]}: {err}")
+    _fall_back_to_cpu(opts, "GPU encoding is not available:\n" + "\n".join(errors))
+    return None
+
+
+def build_cmd(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
+              has_audio: bool, vendor: str | None = None) -> list[str]:
+    """Single-pass, constant-quality encode - used when no file-size budget
+    is in play. vendor picks a GPU encoder (see resolve_gpu); None = CPU."""
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(src)]
     cmd += ["-map", "0:v:0"]
+    # ponytail: decode + scale stay on the CPU, only the encode moves to the GPU.
+    # A full GPU pipeline (scale_cuda / vpp_qsv / scale_vt) is the upgrade if it measurably helps.
     if height is not None:
         cmd += ["-vf", f"scale=-2:{height}"]
-    cmd += ["-c:v", vcodec, "-crf", str(opts.crf), "-preset", opts.preset]
-    cmd += ["-pix_fmt", "yuv420p"]
+    cmd += video_encoder_args(opts, vendor)
     if opts.fps:
         cmd += ["-r", str(opts.fps)]
 
@@ -492,7 +594,7 @@ def run_two_pass(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
                   info: dict, max_size: int, audio_mode: str) -> int:
     audio_bps = 0 if (audio_mode == "none" or not info["has_audio"]) else 128_000
     kbps = compute_bitrate_kbps(max_size, info["duration"], audio_bps)
-    vcodec = "libx265" if opts.codec == "h265" else "libx264"
+    vcodec = cpu_encoder(opts.codec)
     faststart = dst.suffix.lower() in FASTSTART_EXTS
 
     if opts.dry_run:
@@ -563,8 +665,10 @@ def process_one(src: Path, opts: EncodeOptions, target: int | None, preset_max_h
     if not dst.parent.exists():
         raise ResizeError(f"output directory does not exist: {dst.parent}")
 
+    vendor = resolve_gpu(opts, size_mode=effective_max_size is not None)
     if height is not None and effective_max_size is None:
-        status(f"  target : {height}p  ({opts.codec}, crf {opts.crf}, preset {opts.preset})")
+        on = f"{vendor} GPU, {GPU_ENCODERS[vendor][opts.codec]}, quality" if vendor else "crf"
+        status(f"  target : {height}p  ({opts.codec}, {on} {opts.crf}, preset {opts.preset})")
     elif height is not None:
         status(f"  target : {height}p, budget {human_size_tag(effective_max_size)}  ({opts.codec})")
     else:
@@ -574,12 +678,22 @@ def process_one(src: Path, opts: EncodeOptions, target: int | None, preset_max_h
     if effective_max_size is not None:
         rc = run_two_pass(src, dst, height, opts, info, effective_max_size, audio_mode)
     else:
-        cmd = build_cmd(src, dst, height, opts, info["has_audio"])
+        cmd = build_cmd(src, dst, height, opts, info["has_audio"], vendor)
         if opts.dry_run:
             print(" ".join(quote_cmd(cmd)))
             rc = EXIT_OK
         else:
             rc = run_with_progress(cmd, info["duration"], opts.quiet)
+            if rc != 0 and vendor is not None:
+                # GPU passed the trial encode but failed on the real file (busy,
+                # out of memory, unsupported resolution/profile...)
+                try:
+                    _fall_back_to_cpu(opts, f"the {vendor} GPU encode failed (see ffmpeg output above)")
+                except ResizeError:
+                    dst.unlink(missing_ok=True)
+                    raise
+                cmd = build_cmd(src, dst, height, opts, info["has_audio"], None)
+                rc = run_with_progress(cmd, info["duration"], opts.quiet)
 
     if opts.dry_run:
         return ResizeResult(
@@ -656,6 +770,7 @@ def resize(
     overwrite: bool = False,
     dry_run: bool = False,
     quiet: bool = True,
+    gpu: str = "off",
 ) -> ResizeResult:
     """Shrink a single video file. Parameters mirror the CLI flags of the
     same name (target: '720p'/'4k'/720; max_size: '25MB'/25000000;
@@ -666,12 +781,16 @@ def resize(
     being processed (ffmpeg missing, ffmpeg failure, output already exists,
     upscale requested, ...).
 
+    gpu: "off" (default), "auto", "nvidia", "intel", "amd" or "apple". If the
+    GPU can't be used, or fails mid-encode, a ResizeError is raised - there
+    is no silent CPU fallback; call again with gpu="off".
+
     Silent by default - call logging.basicConfig() first (or attach your own
     handler to logging.getLogger("vresize")) to see progress, and/or pass
     quiet=False for the live ffmpeg progress bar on stderr.
     """
     opts = EncodeOptions(codec=codec, crf=crf, preset=preset, audio=audio, fps=fps,
-                          overwrite=overwrite, dry_run=dry_run, quiet=quiet)
+                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, gpu=gpu)
     height = _coerce_target(target)
     size = _coerce_size(max_size)
     preset_size, preset_max_height, preset_note = _preset_lookup(for_platform)
@@ -707,6 +826,7 @@ def resize_directory(
     overwrite: bool = False,
     dry_run: bool = False,
     quiet: bool = True,
+    gpu: str = "off",
 ) -> BatchResult:
     """Shrink every video in a directory (optionally recursive). Same
     parameters as resize() minus output/input-file-specific ones. An output
@@ -714,10 +834,12 @@ def resize_directory(
     a batch run is safe to call again to resume. Raises ValueError/ResizeError
     the same way resize() does for setup problems; a single file's ffmpeg
     failure is recorded in the returned BatchResult rather than raised, so
-    the rest of the batch still runs.
+    the rest of the batch still runs. A GPU failure (see resize()) is
+    recorded per file the same way - re-running with gpu="off" picks up only
+    the files that failed, since finished outputs are skipped.
     """
     opts = EncodeOptions(codec=codec, crf=crf, preset=preset, audio=audio, fps=fps,
-                          overwrite=overwrite, dry_run=dry_run, quiet=quiet)
+                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, gpu=gpu)
     height = _coerce_target(target)
     size = _coerce_size(max_size)
     preset_size, preset_max_height, preset_note = _preset_lookup(for_platform)
@@ -793,7 +915,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                     help="print the ffmpeg command(s) and planned output, run nothing")
     p.add_argument("--quiet", action="store_true", help="suppress the progress bar")
+    p.add_argument("--gpu", choices=GPU_CHOICES, default="off",
+                    help="encode on the GPU (default: off). 'auto' picks the first one that works. "
+                         "Ignored with --max-size/--for, which always use the CPU")
     return p
+
+
+def _ask_cpu_fallback() -> Callable[[str], bool]:
+    """CLI: on a GPU problem, ask once whether to use the CPU; the answer
+    sticks for the rest of the run so a batch doesn't re-ask per file."""
+    answer: list[bool] = []
+
+    def ask(reason: str) -> bool:
+        print(f"vresize: {reason}", file=sys.stderr)
+        if not answer:
+            if not sys.stdin.isatty():
+                print("vresize: not a terminal, so not falling back to the CPU", file=sys.stderr)
+                answer.append(False)
+            else:
+                try:
+                    reply = input("Encode on the CPU instead? (applies to the rest of this run) [y/N] ")
+                except EOFError:
+                    print(file=sys.stderr)
+                    reply = ""
+                answer.append(reply.strip().lower() in ("y", "yes"))
+        return answer[0]
+
+    return ask
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -804,6 +952,7 @@ def main(argv: list[str] | None = None) -> int:
         opts = EncodeOptions(
             codec=args.codec, crf=args.crf, preset=args.preset, audio=args.audio,
             fps=args.fps, overwrite=args.overwrite, dry_run=args.dry_run, quiet=args.quiet,
+            gpu=args.gpu, cpu_fallback=_ask_cpu_fallback(),
         )
     except ValueError as e:
         die(str(e))

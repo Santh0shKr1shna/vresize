@@ -165,6 +165,102 @@ class BuildCmdTests(unittest.TestCase):
         self.assertNotIn("+faststart", cmd)
 
 
+class GpuEncoderArgsTests(unittest.TestCase):
+    def _flag(self, args, name):
+        return args[args.index(name) + 1]
+
+    def test_cpu_unchanged(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(), None)
+        self.assertEqual(args, ["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-pix_fmt", "yuv420p"])
+
+    def test_nvidia(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(codec="h265", preset="slow"), "nvidia")
+        self.assertEqual(self._flag(args, "-c:v"), "hevc_nvenc")
+        self.assertEqual(self._flag(args, "-preset"), "p5")
+        self.assertEqual(self._flag(args, "-cq"), "28")
+        self.assertEqual(self._flag(args, "-b:v"), "0")
+
+    def test_intel(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(preset="ultrafast"), "intel")
+        self.assertEqual(self._flag(args, "-c:v"), "h264_qsv")
+        self.assertEqual(self._flag(args, "-preset"), "veryfast")
+        self.assertEqual(self._flag(args, "-global_quality"), "23")
+        self.assertEqual(self._flag(args, "-pix_fmt"), "nv12")
+
+    def test_amd(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(), "amd")
+        self.assertEqual(self._flag(args, "-c:v"), "h264_amf")
+        self.assertEqual(self._flag(args, "-quality"), "balanced")
+        self.assertEqual(self._flag(args, "-qp_p"), "23")
+
+    def test_apple_quality_scale_inverted(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(), "apple")
+        self.assertEqual(self._flag(args, "-c:v"), "h264_videotoolbox")
+        self.assertEqual(self._flag(args, "-q:v"), "66")
+
+    def test_crf_zero_clamped_for_gpu(self):
+        args = vr.video_encoder_args(vr.EncodeOptions(crf=0), "nvidia")
+        self.assertEqual(self._flag(args, "-cq"), "1")
+
+    def test_every_preset_maps(self):
+        for p in vr.X264_PRESETS:
+            for vendor in vr.GPU_ENCODERS:
+                vr.video_encoder_args(vr.EncodeOptions(preset=p), vendor)
+
+    def test_build_cmd_uses_gpu_encoder(self):
+        cmd = vr.build_cmd(Path("in.mp4"), Path("out.mp4"), 720, vr.EncodeOptions(), True, "nvidia")
+        self.assertIn("h264_nvenc", cmd)
+        self.assertNotIn("-crf", cmd)
+
+    def test_bad_gpu_value_raises(self):
+        with self.assertRaises(ValueError):
+            vr.EncodeOptions(gpu="radeon")
+
+
+class ResolveGpuTests(unittest.TestCase):
+    """probe_gpu is swapped for a fake so these run without any GPU."""
+
+    def setUp(self):
+        self._real = vr.probe_gpu
+        self.working = set()
+        vr.probe_gpu = lambda args: None if args[1] in self.working else "no device"
+
+    def tearDown(self):
+        vr.probe_gpu = self._real
+
+    def test_off_is_cpu(self):
+        self.assertIsNone(vr.resolve_gpu(vr.EncodeOptions(gpu="off"), size_mode=False))
+
+    def test_explicit_vendor_works(self):
+        self.working = {"h264_qsv"}
+        self.assertEqual(vr.resolve_gpu(vr.EncodeOptions(gpu="intel"), size_mode=False), "intel")
+
+    @unittest.skipIf(sys.platform == "darwin", "auto only tries videotoolbox on macOS")
+    def test_auto_skips_broken_vendor(self):
+        self.working = {"h264_qsv"}  # nvidia probed first and fails
+        self.assertEqual(vr.resolve_gpu(vr.EncodeOptions(gpu="auto"), size_mode=False), "intel")
+
+    def test_size_mode_forces_cpu(self):
+        self.working = {"h264_nvenc"}
+        self.assertIsNone(vr.resolve_gpu(vr.EncodeOptions(gpu="nvidia"), size_mode=True))
+
+    def test_failure_without_fallback_raises(self):
+        with self.assertRaises(vr.ResizeError) as cm:
+            vr.resolve_gpu(vr.EncodeOptions(gpu="nvidia"), size_mode=False)
+        self.assertIn("no device", str(cm.exception))
+
+    def test_failure_with_fallback_yes_is_cpu(self):
+        asked = []
+        opts = vr.EncodeOptions(gpu="nvidia", cpu_fallback=lambda r: asked.append(r) or True)
+        self.assertIsNone(vr.resolve_gpu(opts, size_mode=False))
+        self.assertEqual(len(asked), 1)
+
+    def test_failure_with_fallback_no_raises(self):
+        opts = vr.EncodeOptions(gpu="nvidia", cpu_fallback=lambda r: False)
+        with self.assertRaises(vr.ResizeError):
+            vr.resolve_gpu(opts, size_mode=False)
+
+
 class ComputeBitrateTests(unittest.TestCase):
     def test_basic(self):
         # 25MB over 60s, no audio: ~ (25*1024*1024*8*0.98) / 60 / 1000 kbps
@@ -324,6 +420,17 @@ class PublicApiIntegrationTests(unittest.TestCase):
         out = Path(self.tmpdir) / "out_180p.mp4"
         result = vr.resize(self.clip, "180p", output=str(out))
         self.assertTrue(result.output.exists())
+        self.assertEqual(result.output_height, 180)
+        self.assertGreater(result.output_size, 0)
+        out.unlink()
+
+    def test_real_gpu_downscale(self):
+        try:
+            vendor = vr.resolve_gpu(vr.EncodeOptions(gpu="auto"), size_mode=False)
+        except vr.ResizeError as e:
+            self.skipTest(f"no working GPU encoder here: {e}")
+        out = Path(self.tmpdir) / "out_gpu_180p.mp4"
+        result = vr.resize(self.clip, "180p", output=str(out), gpu=vendor)
         self.assertEqual(result.output_height, 180)
         self.assertGreater(result.output_size, 0)
         out.unlink()
