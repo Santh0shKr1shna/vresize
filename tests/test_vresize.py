@@ -164,6 +164,18 @@ class BuildCmdTests(unittest.TestCase):
         cmd = vr.build_cmd(Path("in.mkv"), Path("out.mkv"), 720, self._args(), has_audio=True)
         self.assertNotIn("+faststart", cmd)
 
+    def test_threads_passed_to_cpu_encode(self):
+        cmd = vr.build_cmd(Path("in.mp4"), Path("out.mp4"), 720, self._args(threads=2), has_audio=True)
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")
+
+    def test_no_threads_flag_by_default(self):
+        cmd = vr.build_cmd(Path("in.mp4"), Path("out.mp4"), 720, self._args(), has_audio=True)
+        self.assertNotIn("-threads", cmd)
+
+    def test_threads_ignored_on_gpu(self):
+        cmd = vr.build_cmd(Path("in.mp4"), Path("out.mp4"), 720, self._args(threads=2), True, "nvidia")
+        self.assertNotIn("-threads", cmd)
+
 
 class GpuEncoderArgsTests(unittest.TestCase):
     def _flag(self, args, name):
@@ -216,6 +228,13 @@ class GpuEncoderArgsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             vr.EncodeOptions(gpu="radeon")
 
+    def test_negative_threads_raises(self):
+        with self.assertRaises(ValueError):
+            vr.EncodeOptions(threads=-1)
+
+    def test_zero_threads_allowed(self):
+        self.assertEqual(vr.EncodeOptions(threads=0).threads, 0)
+
 
 class ResolveGpuTests(unittest.TestCase):
     """probe_gpu is swapped for a fake so these run without any GPU."""
@@ -259,6 +278,18 @@ class ResolveGpuTests(unittest.TestCase):
         opts = vr.EncodeOptions(gpu="nvidia", cpu_fallback=lambda r: False)
         with self.assertRaises(vr.ResizeError):
             vr.resolve_gpu(opts, size_mode=False)
+
+
+class BuildPassCmdTests(unittest.TestCase):
+    def test_threads_passed_through_on_pass2(self):
+        cmd = vr.build_pass_cmd(Path("in.mp4"), Path("out.mp4"), 720, "libx264", "medium",
+                                 2000.0, 2, "passlog", None, "aac", True, True, threads=2)
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")
+
+    def test_no_threads_flag_by_default(self):
+        cmd = vr.build_pass_cmd(Path("in.mp4"), Path("out.mp4"), 720, "libx264", "medium",
+                                 2000.0, 1, "passlog", None, "aac", True, True)
+        self.assertNotIn("-threads", cmd)
 
 
 class ComputeBitrateTests(unittest.TestCase):

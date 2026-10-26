@@ -100,6 +100,7 @@ class EncodeOptions:
     overwrite: bool = False
     dry_run: bool = False
     quiet: bool = True
+    threads: int | None = None  # None = ffmpeg's own default (usually: use every core)
     gpu: str = "off"
     # Asked (with the reason) when the GPU can't be used or fails mid-encode;
     # True = redo on the CPU. None = no fallback, raise ResizeError instead.
@@ -117,6 +118,8 @@ class EncodeOptions:
             )
         if self.gpu not in GPU_CHOICES:
             raise ValueError(f"gpu must be one of: {', '.join(GPU_CHOICES)} (got {self.gpu!r})")
+        if self.threads is not None and self.threads < 0:
+            raise ValueError(f"threads must be >= 0 (got {self.threads}); 0 or unset means ffmpeg's own default")
 
 
 # --- public result types -----------------------------------------------
@@ -381,8 +384,11 @@ def video_encoder_args(opts: EncodeOptions, vendor: str | None) -> list[str]:
     each one's nearest equivalent, so the same number gives a different size
     per encoder (documented in the README)."""
     if vendor is None:
-        return ["-c:v", cpu_encoder(opts.codec), "-crf", str(opts.crf),
+        args = ["-c:v", cpu_encoder(opts.codec), "-crf", str(opts.crf),
                 "-preset", opts.preset, "-pix_fmt", "yuv420p"]
+        if opts.threads is not None:
+            args += ["-threads", str(opts.threads)]
+        return args
     q = str(max(1, opts.crf))  # 0 means "encoder decides" on NVENC, invalid on QSV
     args = ["-c:v", GPU_ENCODERS[vendor][opts.codec]]
     if vendor == "nvidia":
@@ -501,13 +507,16 @@ def compute_bitrate_kbps(max_size_bytes: int, duration: float | None, audio_bps:
 
 def build_pass_cmd(src: Path, dst: Path, height: int | None, vcodec: str, preset: str,
                     kbps: float, pass_num: int, passlogfile: str, fps: float | None,
-                    audio_mode: str, has_audio: bool, faststart: bool) -> list[str]:
+                    audio_mode: str, has_audio: bool, faststart: bool,
+                    threads: int | None = None) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(src)]
     cmd += ["-map", "0:v:0"]
     if height is not None:
         cmd += ["-vf", f"scale=-2:{height}"]
     cmd += ["-c:v", vcodec, "-b:v", f"{kbps:.0f}k", "-preset", preset]
     cmd += ["-pix_fmt", "yuv420p"]
+    if threads is not None:
+        cmd += ["-threads", str(threads)]
     if fps:
         cmd += ["-r", str(fps)]
     cmd += ["-pass", str(pass_num), "-passlogfile", passlogfile]
@@ -601,7 +610,8 @@ def run_two_pass(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
         placeholder_log = str(Path(tempfile.gettempdir()) / "vresize-2pass" / "pass")
         for n in (1, 2):
             cmd = build_pass_cmd(src, dst, height, vcodec, opts.preset, kbps, n,
-                                  placeholder_log, opts.fps, audio_mode, info["has_audio"], faststart)
+                                  placeholder_log, opts.fps, audio_mode, info["has_audio"], faststart,
+                                  opts.threads)
             print(" ".join(quote_cmd(cmd)))
         return EXIT_OK
 
@@ -611,7 +621,8 @@ def run_two_pass(src: Path, dst: Path, height: int | None, opts: EncodeOptions,
         passlog = str(Path(tmpdir) / "pass")
         for n in (1, 2):
             cmd = build_pass_cmd(src, dst, height, vcodec, opts.preset, kbps, n,
-                                  passlog, opts.fps, audio_mode, info["has_audio"], faststart)
+                                  passlog, opts.fps, audio_mode, info["has_audio"], faststart,
+                                  opts.threads)
             rc = run_with_progress(cmd, info["duration"], opts.quiet, label=f"[pass {n}/2] ")
             if rc != 0:
                 return rc
@@ -770,6 +781,7 @@ def resize(
     overwrite: bool = False,
     dry_run: bool = False,
     quiet: bool = True,
+    threads: int | None = None,
     gpu: str = "off",
 ) -> ResizeResult:
     """Shrink a single video file. Parameters mirror the CLI flags of the
@@ -781,6 +793,11 @@ def resize(
     being processed (ffmpeg missing, ffmpeg failure, output already exists,
     upscale requested, ...).
 
+    threads: cap how many CPU threads the encoder uses (ignored on a GPU
+    encoder, which doesn't use the CPU this way). None (default) lets
+    ffmpeg use every core; lower values trade encode speed for a lighter
+    CPU/heat/fan-noise footprint.
+
     gpu: "off" (default), "auto", "nvidia", "intel", "amd" or "apple". If the
     GPU can't be used, or fails mid-encode, a ResizeError is raised - there
     is no silent CPU fallback; call again with gpu="off".
@@ -790,7 +807,7 @@ def resize(
     quiet=False for the live ffmpeg progress bar on stderr.
     """
     opts = EncodeOptions(codec=codec, crf=crf, preset=preset, audio=audio, fps=fps,
-                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, gpu=gpu)
+                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, threads=threads, gpu=gpu)
     height = _coerce_target(target)
     size = _coerce_size(max_size)
     preset_size, preset_max_height, preset_note = _preset_lookup(for_platform)
@@ -826,6 +843,7 @@ def resize_directory(
     overwrite: bool = False,
     dry_run: bool = False,
     quiet: bool = True,
+    threads: int | None = None,
     gpu: str = "off",
 ) -> BatchResult:
     """Shrink every video in a directory (optionally recursive). Same
@@ -839,7 +857,7 @@ def resize_directory(
     the files that failed, since finished outputs are skipped.
     """
     opts = EncodeOptions(codec=codec, crf=crf, preset=preset, audio=audio, fps=fps,
-                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, gpu=gpu)
+                          overwrite=overwrite, dry_run=dry_run, quiet=quiet, threads=threads, gpu=gpu)
     height = _coerce_target(target)
     size = _coerce_size(max_size)
     preset_size, preset_max_height, preset_note = _preset_lookup(for_platform)
@@ -915,6 +933,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                     help="print the ffmpeg command(s) and planned output, run nothing")
     p.add_argument("--quiet", action="store_true", help="suppress the progress bar")
+    p.add_argument("--threads", type=int, metavar="N",
+                    help="cap CPU threads used for encoding (default: ffmpeg uses every core). "
+                         "Lower = slower encode, less CPU load/heat. Ignored on a GPU encoder")
     p.add_argument("--gpu", choices=GPU_CHOICES, default="off",
                     help="encode on the GPU (default: off). 'auto' picks the first one that works. "
                          "Ignored with --max-size/--for, which always use the CPU")
@@ -952,7 +973,7 @@ def main(argv: list[str] | None = None) -> int:
         opts = EncodeOptions(
             codec=args.codec, crf=args.crf, preset=args.preset, audio=args.audio,
             fps=args.fps, overwrite=args.overwrite, dry_run=args.dry_run, quiet=args.quiet,
-            gpu=args.gpu, cpu_fallback=_ask_cpu_fallback(),
+            threads=args.threads, gpu=args.gpu, cpu_fallback=_ask_cpu_fallback(),
         )
     except ValueError as e:
         die(str(e))

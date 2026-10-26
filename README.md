@@ -94,6 +94,7 @@ size and resolution at once).
 | `--overwrite`            | replace an existing output file (in batch mode, an existing output is *skipped* instead, unless this is set) |
 | `--dry-run`              | print the ffmpeg command(s) and planned output, run nothing      |
 | `--quiet`                | suppress the progress bar                                        |
+| `--threads N`            | cap CPU threads used for encoding (default: every core); lower = slower but lighter on the CPU/fans; ignored on a GPU encoder |
 | `--gpu {off,auto,nvidia,intel,amd,apple}` | encode on the GPU (default `off`), see [GPU encoding](#gpu-encoding) |
 
 `vresize` only downscales, it refuses a resolution target that isn't smaller
@@ -234,6 +235,18 @@ The library never prompts: a GPU problem raises `ResizeError`, or in
 `resize_directory()` marks that file as failed. Calling `resize_directory()`
 again with `gpu="off"` redoes only the failed files, since finished outputs
 are skipped.
+
+### Capping CPU usage
+
+CPU encoding (the default) uses every core by design — that's what makes it
+fast. But if you want to cap the thread count:
+
+```
+vresize clip.mp4 720p --threads 2      # only ~2 cores' utilised
+```
+
+Fewer threads means a slower encode, roughly in proportion. This option will be ignored with `--gpu`, since hardware encoders
+don't use the CPU the same way.
 
 ## Design principles
 
